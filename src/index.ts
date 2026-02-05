@@ -32,11 +32,11 @@ server.registerTool(
   {
     title: "Search Documents",
     description: "Full-text keyword search in a MeiliSearch index",
-    inputSchema: {
+    inputSchema: z.object({
       query: z.string().describe("The search query string"),
       limit: z.number().optional().describe("Maximum number of results to return (default: 20)"),
       offset: z.number().optional().describe("Number of results to skip (default: 0)"),
-    },
+    }),
   },
   async (args) => {
     console.log(`Received search request with query: ${args.query}`);
@@ -71,17 +71,6 @@ app.use(
 );
 
 app.post('/', async (req, res) => {
-  try {
-    await statelessTransport.handleRequest(req, res, req.body);
-  } catch (error) {
-    console.error('Error handling MCP request:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  }
-});
-
-app.post('/mcp', async (req, res) => {
   try {
     await statelessTransport.handleRequest(req, res, req.body);
   } catch (error) {
