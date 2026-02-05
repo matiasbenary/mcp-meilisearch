@@ -2,10 +2,11 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express from "express";
+import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { Meilisearch } from "meilisearch";
 import { z } from "zod";
 import cors from "cors";
+import express from "express";
 
 // Create MeiliSearch client from environment variables
 const MEILI_HOST = process.env.MEILI_HOST || "http://127.0.0.1:7700";
@@ -17,76 +18,87 @@ const client = new Meilisearch({
   apiKey: MEILI_API_KEY,
 });
 
-// Create MCP server
-const server = new McpServer({
-  name: "meilisearch-mcp-server",
-  version: "1.0.0",
+// Function to create a new MCP server instance with tools
+function createServer(): McpServer {
+  const srv = new McpServer({
+    name: "meilisearch-mcp-server",
+    version: "1.0.0",
+  });
+
+  // Register search tool
+  const searchSchema = z.object({
+    query: z.string().describe("The search query string"),
+    limit: z.number().optional().describe("Maximum number of results to return (default: 20)"),
+    offset: z.number().optional().describe("Number of results to skip (default: 0)"),
+  });
+
+  srv.registerTool(
+    "search",
+    {
+      title: "Search Documents",
+      description: "Full-text keyword search in a MeiliSearch index",
+      inputSchema: searchSchema,
+    },
+    async (args: z.infer<typeof searchSchema>) => {
+      console.log(`Received search request with query: ${args.query}`);
+      const index = client.index(MEILI_INDEX_NAME);
+      const results = await index.search(args.query, {
+        limit: args.limit,
+        offset: args.offset,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+      };
+    }
+  );
+
+  return srv;
+}
+
+const MCP_HOST = process.env.MCP_HOST || "localhost";
+
+// Set up Express with StreamableHTTPServerTransport
+const app = createMcpExpressApp({ 
+  host: '0.0.0.0', // Bind to all interfaces for public access
+  allowedHosts: [MCP_HOST], // DNS rebinding protection for the deployment domain
 });
-
-// ============================================
-// SEARCH TOOLS
-// ============================================
-
-server.registerTool(
-  "search",
-  {
-    title: "Search Documents",
-    description: "Full-text keyword search in a MeiliSearch index",
-    inputSchema: z.object({
-      query: z.string().describe("The search query string"),
-      limit: z.number().optional().describe("Maximum number of results to return (default: 20)"),
-      offset: z.number().optional().describe("Number of results to skip (default: 0)"),
-    }),
-  },
-  async (args) => {
-    console.log(`Received search request with query: ${args.query}`);
-    const index = client.index(MEILI_INDEX_NAME);
-    const results = await index.search(args.query, {
-      limit: args.limit,
-      offset: args.offset,
-    });
-    return {
-      content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
-    };
-  }
-);
-  
-// Stateless mode - explicitly set session ID to undefined
-const statelessTransport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: undefined,
-});
-
-await server.connect(statelessTransport);
-
-// Set up Express server to handle MCP requests
-const app = express();
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-app.use(
-  cors({
-    origin: true, // Allow any origin for public server
-    methods: ['GET', 'POST'],
-    allowedHeaders: "Authorization, Origin, Content-Type, Accept, *",
-  })
-);
+const PORT = process.env.PORT || 3000;
 
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.send('Add this MCP server to your agent so they can search in our docs!');
+});
+
+// MCP HTTP endpoint using StreamableHTTPServerTransport (stateless)
 app.post('/', async (req, res) => {
   try {
-    await statelessTransport.handleRequest(req, res, req.body);
+    // Create a new stateless transport for each request
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // set to undefined for stateless servers
+      enableJsonResponse: true,
+    });
+
+    // Create a new server instance for this transport and connect it
+    const serverInstance = createServer();
+    await serverInstance.connect(transport);
+
+    // Handle the request with the transport
+    await transport.handleRequest(req, res, req.body);
   } catch (error) {
     console.error('Error handling MCP request:', error);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Internal server error' });
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+      });
     }
   }
 });
 
-app.get('/', (req, res) => {
-  res.send('Add this MCP server as a tool in your agent to allow it to search in our Docs!');
-});
-
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`MCP server is running on port ${PORT}`);
-  console.log(`Access at: https://docs.near.org/mcp`);
+  console.log(`MCP server running on http://localhost:${PORT}`);
+  console.log(`POST MCP requests to http://localhost:${PORT}/mcp`);
 });
