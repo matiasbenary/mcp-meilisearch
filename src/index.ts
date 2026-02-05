@@ -78,8 +78,15 @@ app.use(
   })
 );
 
-app.post('/', (req, res) => {
-  statelessTransport.handleRequest(req, res, req.body);
+app.post('/', async (req, res) => {
+  try {
+    await statelessTransport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error('Error handling MCP request:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
 });
 
 app.get('/', (req, res) => {
