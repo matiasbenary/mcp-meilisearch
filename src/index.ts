@@ -8,13 +8,13 @@ import { z } from "zod";
 import cors from "cors";
 
 // Create MeiliSearch client from environment variables
-const MEILISEARCH_HOST = process.env.MEILISEARCH_HOST || "http://127.0.0.1:7700";
-const MEILISEARCH_API_KEY = process.env.MEILISEARCH_API_KEY || "";
+const MEILI_HOST = process.env.MEILI_HOST || "http://127.0.0.1:7700";
+const MEILI_API_KEY = process.env.MEILI_SEARCH_KEY || "";
 const MEILI_INDEX_NAME = process.env.MEILI_INDEX_NAME || "near-docs";
 
 const client = new Meilisearch({
-  host: MEILISEARCH_HOST,
-  apiKey: MEILISEARCH_API_KEY,
+  host: MEILI_HOST,
+  apiKey: MEILI_API_KEY,
 });
 
 // Create MCP server
