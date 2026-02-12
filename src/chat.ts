@@ -87,7 +87,7 @@ export async function chatHandler(req: Request, res: Response) {
     }
 
     const messages: Anthropic.MessageParam[] = [
-      ...conversationHistory.slice(-6),
+      ...conversationHistory.slice(-4),
       { role: "user", content: userMessage },
     ];
 
@@ -108,7 +108,7 @@ export async function chatHandler(req: Request, res: Response) {
           mcp_server_name: "near-docs",
         },
       ],
-      temperature: 0.3,
+      temperature: 0.1,
       max_tokens: 1024,
     };
 
@@ -118,6 +118,13 @@ export async function chatHandler(req: Request, res: Response) {
     let response = await (anthropic as any).beta.messages.create({
       ...mcpConfig,
       messages,
+    });
+
+    console.log({
+      input_tokens: response.usage.input_tokens,
+      output_tokens: response.usage.output_tokens,
+      cache_read_tokens: response.usage.cache_read_input_tokens || 0,
+      cache_creation_tokens: response.usage.cache_creation_input_tokens || 0,
     });
 
     let iterations = 0;
@@ -131,6 +138,13 @@ export async function chatHandler(req: Request, res: Response) {
       response = await (anthropic as any).beta.messages.create({
         ...mcpConfig,
         messages,
+      });
+
+      console.log({
+        input_tokens: response.usage.input_tokens,
+        output_tokens: response.usage.output_tokens,
+        cache_read_tokens: response.usage.cache_read_input_tokens || 0,
+        cache_creation_tokens: response.usage.cache_creation_input_tokens || 0,
       });
     }
 
