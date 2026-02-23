@@ -18,6 +18,7 @@ Rules:
 - Use Markdown with code blocks, headings, and bold for key terms.
 - Include code examples and CLI commands from the docs when relevant.
 - Do not start with a title, and never enumerate sections (i.e. say "Title" instead of "1. Title").
+- Do not use ":::" for admonitions, simply use "Note:", "Warning:", etc.
 - Include inline references to the docs in your answer when relevant, using the format [title](path).`;
 
 function buildSearchContext(results: SearchResult[]): string {
