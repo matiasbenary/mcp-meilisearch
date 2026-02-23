@@ -1,150 +1,76 @@
 import type { Request, Response } from "express";
-import Groq from "groq-sdk";
-import { Meilisearch } from "meilisearch";
+import { streamText } from "ai";
+import { anthropic } from "@ai-sdk/anthropic";
+import { searchNearDocs, type SearchResult } from "./searchClient.js";
 
-
-const MEILI_HOST = process.env.MEILI_HOST || "http://127.0.0.1:7700";
-const MEILI_API_KEY = process.env.MEILI_SEARCH_KEY || "";
-const MEILI_INDEX_NAME = process.env.MEILI_INDEX_NAME || "near-docs";
-
-const meiliClient = new Meilisearch({
-  host: MEILI_HOST,
-  apiKey: MEILI_API_KEY,
-});
-
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
-
-const chatIndex = meiliClient.index(MEILI_INDEX_NAME);
-
-const threads = new Map<string, Array<{ role: string; content: string }>>();
-
-const SYSTEM_PROMPT = `You are an expert assistant for NEAR Protocol documentation.
-Your role is to help developers understand and build on NEAR Protocol based on the official documentation.
-
-## Response guidelines
-- Answer questions based ONLY on the provided documentation context. Do not invent or assume information
-- If the documentation doesn't cover the topic, say so clearly and suggest related topics that might help
-- Always answer in the same language the user writes in
-
-## Code examples
-- Include working code examples when relevant, using the latest NEAR SDK patterns
-- Specify the language/SDK (e.g. near-api-js, near-sdk-rs, near-sdk-js) when showing code
-- Add brief inline comments to explain non-obvious parts
-
-## Formatting
-- Use Markdown: headings, code blocks with syntax highlighting, bullet points, and bold for key terms
-- When referencing documentation, mention the section name and path
-- Keep answers concise but complete — prefer short paragraphs over walls of text
-- Use step-by-step instructions for multi-part processes
-
-## Scope
-- If the question is unrelated to NEAR Protocol, politely redirect the user
-- For ambiguous questions, ask for clarification before answering`;
-
-async function searchDocs(query: string) {
-  try {
-    const results = await chatIndex.search(query, {
-      hybrid: {
-        semanticRatio: 0.7,
-        embedder: "default",
-      },
-      limit: 5,
-    });
-    return results.hits;
-  } catch (error: any) {
-    console.error("Search error:", error.message);
-    return [];
-  }
+interface HistoryMessage {
+  role: "user" | "assistant";
+  content: string;
 }
 
-function buildContext(docs: any[]) {
-  if (docs.length === 0) {
-    return "No relevant documentation found.";
-  }
+const SYSTEM_PROMPT = `You answer questions about NEAR Protocol using ONLY the provided <search_results>.
 
-  return docs
-    .map((doc) => {
-      const title = doc.title || "Untitled";
-      const content = doc.content || "";
-      const path = doc.path || "";
-      return `### ${title}\nPath: ${path}\n\n${content.substring(0, 2000)}`;
-    })
-    .join("\n\n---\n\n");
+Rules:
+- Use ONLY information from <search_results>. NEVER invent APIs, methods, or code not present in the docs.
+- If the docs don't cover the topic, you might need to search with different keywords.
+- If after three attempts you can't find relevant info, say "I couldn't find an answer in the docs."
+- Answer in the user's language. Use Markdown with code blocks, headings, and bold for key terms.
+- Keep answers concise. Include code examples from the docs when relevant.
+- NEVER answer questions outside the topics covered by NEAR Docs.
+- Include inline references to the docs in your answer when relevant, using the format [title](path).`;
+
+function buildSearchContext(results: SearchResult[]): string {
+  if (results.length === 0) return "<search_results>No results found.</search_results>";
+  const docs = results
+    .map((r, i) => `<doc title="${r.title}" path="${r.path}">\n${r.content}\n</doc>`)
+    .join("\n");
+  return `<search_results>\n${docs}\n</search_results>`;
 }
 
 export async function chatHandler(req: Request, res: Response) {
-  if (!groq) {
-    res.status(503).json({ error: "GROQ_API_KEY is not configured" });
-    return;
-  }
-
   try {
-    const { messages: userMessage, threadId } = req.body;
+    const { message, history = [] }: { message: string; history: HistoryMessage[] } = req.body;
 
-    if (!userMessage) {
+    if (!message) {
       res.status(400).json({ error: "Message is required" });
       return;
     }
 
-    let conversationHistory: Array<{ role: string; content: string }> = [];
-    if (threadId && threads.has(threadId)) {
-      conversationHistory = threads.get(threadId)!;
-    }
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
 
-    const docs = await searchDocs(userMessage);
-    const context = buildContext(docs);
+    // Always search docs first — no tool-calling overhead
+    const searchResults = await searchNearDocs(message);
+    const searchContext = buildSearchContext(searchResults);
 
-    const groqMessages = [
-      {
-        role: "system" as const,
-        content: `${SYSTEM_PROMPT}\n\n## Documentation Context:\n\n${context}`,
-      },
-      ...conversationHistory.slice(-6).map((m) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      })),
-      {
-        role: "user" as const,
-        content: userMessage,
-      },
-    ];
-
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: groqMessages,
-      temperature: 0.3,
-      max_tokens: 1024,
+    const result = streamText({
+      model: anthropic("claude-haiku-4-5"),
+      system: SYSTEM_PROMPT,
+      messages: [
+        ...history.map((m) => ({ role: m.role, content: m.content })),
+        { role: "user", content: `${searchContext}\n\n${message}` },
+      ],
+      temperature: 0,
+      maxOutputTokens: 1024,
     });
 
-    const assistantMessage =
-      completion.choices[0]?.message?.content || "No response generated.";
-
-    const newThreadId = threadId || `thread_${Date.now()}`;
-    const updatedHistory = [
-      ...conversationHistory,
-      { role: "user", content: userMessage },
-      { role: "assistant", content: assistantMessage },
-    ];
-    threads.set(newThreadId, updatedHistory);
-
-    if (threads.size > 100) {
-      const oldestKey = threads.keys().next().value;
-      if (oldestKey) threads.delete(oldestKey);
+    for await (const chunk of result.textStream) {
+      res.write(`data: ${JSON.stringify({ type: "text", text: chunk })}\n\n`);
     }
 
-    const sources = docs.slice(0, 3).map((doc: any) => ({
-      title: doc.title,
-      path: doc.path,
-    }));
+    await result.text;
 
-    res.json({
-      message: assistantMessage,
-      threadId: newThreadId,
-      sources,
-    });
+    const sources = searchResults
+      .filter((r) => r.path)
+      .map((r) => ({ title: r.title, path: r.path }));
+
+    res.write(`data: ${JSON.stringify({ type: "sources", sources })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
+    res.end();
   } catch (error) {
     console.error("Chat error:", error);
-    res.status(500).json({ error: "Failed to process chat request" });
+    res.write(`data: ${JSON.stringify({ type: "error", error: "Failed to process chat request" })}\n\n`);
+    res.end();
   }
 }
