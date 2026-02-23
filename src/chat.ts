@@ -1,39 +1,31 @@
 import type { Request, Response } from "express";
-import { generateText, tool, stepCountIs } from "ai";
+import { streamText } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
-import { z } from "zod";
-import { searchNearDocs } from "./searchClient.js";
+import { searchNearDocs, type SearchResult } from "./searchClient.js";
 
 interface HistoryMessage {
   role: "user" | "assistant";
   content: string;
 }
 
-const SYSTEM_PROMPT = `You are an expert assistant for NEAR Protocol documentation.
-Your role is to help developers understand and build on NEAR Protocol based on the official documentation.
+const SYSTEM_PROMPT = `You answer questions about NEAR Protocol using ONLY the provided <search_results>.
 
-You have access to a search tool that lets you query the NEAR documentation. Use it to find relevant information before answering questions.
+Rules:
+- Use ONLY information from <search_results>. NEVER invent APIs, methods, or code not present in the docs.
+- If the docs don't cover the topic, you might need to search with different keywords.
+- If after three attempts you can't find relevant info, say "I couldn't find an answer in the docs."
+- Answer in the user's language. Use Markdown with code blocks, headings, and bold for key terms.
+- Keep answers concise. Include code examples from the docs when relevant.
+- NEVER answer questions outside the topics covered by NEAR Docs.
+- Include inline references to the docs in your answer when relevant, using the format [title](path).`;
 
-## Response guidelines
-- Always search the documentation before answering technical questions
-- Answer questions based ONLY on the documentation results. Do not invent or assume information
-- If the documentation doesn't cover the topic, say so clearly and suggest related topics that might help
-- Always answer in the same language the user writes in
-
-## Code examples
-- Include working code examples when relevant, using the latest NEAR SDK patterns
-- Specify the language/SDK (e.g. near-api-js, near-sdk-rs, near-sdk-js) when showing code
-- Add brief inline comments to explain non-obvious parts
-
-## Formatting
-- Use Markdown: headings, code blocks with syntax highlighting, bullet points, and bold for key terms
-- When referencing documentation, mention the section name and path
-- Keep answers concise but complete — prefer short paragraphs over walls of text
-- Use step-by-step instructions for multi-part processes
-
-## Scope
-- If the question is unrelated to NEAR Protocol, politely redirect the user
-- For ambiguous questions, ask for clarification before answering`;
+function buildSearchContext(results: SearchResult[]): string {
+  if (results.length === 0) return "<search_results>No results found.</search_results>";
+  const docs = results
+    .map((r, i) => `<doc title="${r.title}" path="${r.path}">\n${r.content}\n</doc>`)
+    .join("\n");
+  return `<search_results>\n${docs}\n</search_results>`;
+}
 
 export async function chatHandler(req: Request, res: Response) {
   try {
@@ -44,49 +36,41 @@ export async function chatHandler(req: Request, res: Response) {
       return;
     }
 
-    const sources: Array<{ title: string; path: string }> = [];
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
 
-    const { text } = await generateText({
+    // Always search docs first — no tool-calling overhead
+    const searchResults = await searchNearDocs(message);
+    const searchContext = buildSearchContext(searchResults);
+
+    const result = streamText({
       model: anthropic("claude-haiku-4-5"),
       system: SYSTEM_PROMPT,
       messages: [
         ...history.map((m) => ({ role: m.role, content: m.content })),
-        { role: "user", content: message },
+        { role: "user", content: `${searchContext}\n\n${message}` },
       ],
-      tools: {
-        search_near_docs: tool({
-          description:
-            "Search the NEAR Protocol documentation for relevant information. Use this to find accurate, up-to-date information before answering technical questions.",
-          inputSchema: z.object({
-            query: z.string().describe("The search query to find relevant documentation"),
-            limit: z.number().optional().describe("Maximum number of results to return (default: 5)"),
-          }),
-          execute: async ({ query, limit = 5 }) => {
-            const results = await searchNearDocs(query, limit);
-            for (const result of results.slice(0, 3)) {
-              if (result.title || result.path) {
-                sources.push({ title: result.title || "Untitled", path: result.path || "" });
-              }
-            }
-            return results;
-          },
-        }),
-      },
-      stopWhen: stepCountIs(5),
-      temperature: 0.1,
+      temperature: 0,
       maxOutputTokens: 1024,
     });
 
-    const uniqueSources = sources.filter(
-      (s, i, arr) => arr.findIndex((x) => x.path === s.path) === i
-    );
+    for await (const chunk of result.textStream) {
+      res.write(`data: ${JSON.stringify({ type: "text", text: chunk })}\n\n`);
+    }
 
-    res.json({
-      message: text,
-      sources: uniqueSources,
-    });
+    await result.text;
+
+    const sources = searchResults
+      .filter((r) => r.path)
+      .map((r) => ({ title: r.title, path: r.path }));
+
+    res.write(`data: ${JSON.stringify({ type: "sources", sources })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
+    res.end();
   } catch (error) {
     console.error("Chat error:", error);
-    res.status(500).json({ error: "Failed to process chat request" });
+    res.write(`data: ${JSON.stringify({ type: "error", error: "Failed to process chat request" })}\n\n`);
+    res.end();
   }
 }
