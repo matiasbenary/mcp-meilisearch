@@ -38,13 +38,13 @@ export async function chatHandler(req: Request, res: Response) {
       return;
     }
 
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-
     // Always search docs first — no tool-calling overhead
     const searchResults = await searchNearDocs(message);
     const searchContext = buildSearchContext(searchResults);
+
+    const sources = searchResults
+      .filter((r) => r.path)
+      .map((r) => ({ title: r.title, path: r.path }));
 
     const result = streamText({
       model: anthropic("claude-haiku-4-5"),
@@ -57,19 +57,10 @@ export async function chatHandler(req: Request, res: Response) {
       maxOutputTokens: 1024,
     });
 
-    for await (const chunk of result.textStream) {
-      res.write(`data: ${JSON.stringify({ type: "text", text: chunk })}\n\n`);
-    }
-
-    await result.text;
-
-    const sources = searchResults
-      .filter((r) => r.path)
-      .map((r) => ({ title: r.title, path: r.path }));
-
-    res.write(`data: ${JSON.stringify({ type: "sources", sources })}\n\n`);
-    res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
-    res.end();
+    result.pipeUIMessageStreamToResponse(res, {
+      messageMetadata: ({ part }) =>
+        part.type === "finish" ? { sources } : undefined,
+    });
   } catch (error) {
     console.error("Chat error:", error);
     res.write(`data: ${JSON.stringify({ type: "error", error: "Failed to process chat request" })}\n\n`);
