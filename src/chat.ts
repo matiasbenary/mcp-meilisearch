@@ -1,39 +1,30 @@
 import type { Request, Response } from "express";
-import { generateText, tool, stepCountIs } from "ai";
+import { streamText, tool, stepCountIs } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
 import { z } from "zod";
 import { searchNearDocs } from "./searchClient.js";
+import { fetchNearDoc } from "./webSearch.js";
 
 interface HistoryMessage {
   role: "user" | "assistant";
   content: string;
 }
 
-const SYSTEM_PROMPT = `You are an expert assistant for NEAR Protocol documentation.
-Your role is to help developers understand and build on NEAR Protocol based on the official documentation.
+const SYSTEM_PROMPT = `You answer questions about NEAR Protocol using the tools searchDocs and fetchDoc to find relevant information in the NEAR documentation.
 
-You have access to a search tool that lets you query the NEAR documentation. Use it to find relevant information before answering questions.
-
-## Response guidelines
-- Always search the documentation before answering technical questions
-- Answer questions based ONLY on the documentation results. Do not invent or assume information
-- If the documentation doesn't cover the topic, say so clearly and suggest related topics that might help
-- Always answer in the same language the user writes in
-
-## Code examples
-- Include working code examples when relevant, using the latest NEAR SDK patterns
-- Specify the language/SDK (e.g. near-api-js, near-sdk-rs, near-sdk-js) when showing code
-- Add brief inline comments to explain non-obvious parts
-
-## Formatting
-- Use Markdown: headings, code blocks with syntax highlighting, bullet points, and bold for key terms
-- When referencing documentation, mention the section name and path
-- Keep answers concise but complete — prefer short paragraphs over walls of text
-- Use step-by-step instructions for multi-part processes
-
-## Scope
-- If the question is unrelated to NEAR Protocol, politely redirect the user
-- For ambiguous questions, ask for clarification before answering`;
+Rules:
+- Keep answers concise.
+- Use ONLY information from tools results. NEVER invent APIs, methods, or code not present in the docs.
+- If the user requests a specific doc, fetch it to find the answer. Otherwise, search the docs for relevant information.
+- If the search returns docs that are not relevant, you might need to search with different keywords.
+- Explain in one line what you will do if you use a tool (e.g. "Let me search the docs" or "Let me fetch that doc"), include a new line after that.
+- You might not need to use both tools, but you should use at least one to find the answer.
+- If after using the tools you can't find the answer, say "I couldn't find an answer in the docs."
+- Use Markdown with code blocks, headings, and bold for key terms.
+- Include code examples and CLI commands from the docs when relevant.
+- Do not start with a title, and never enumerate sections (i.e. say "Title" instead of "1. Title").
+- Do not use ":::" for admonitions, simply use "Note:", "Warning:", etc.
+- Include inline references using the format [title](path).`;
 
 export async function chatHandler(req: Request, res: Response) {
   try {
@@ -44,9 +35,9 @@ export async function chatHandler(req: Request, res: Response) {
       return;
     }
 
-    const sources: Array<{ title: string; path: string }> = [];
+    let sources: {title: string; path: string;}[] = [];
 
-    const { text } = await generateText({
+    const result = streamText({
       model: anthropic("claude-haiku-4-5"),
       system: SYSTEM_PROMPT,
       messages: [
@@ -54,39 +45,41 @@ export async function chatHandler(req: Request, res: Response) {
         { role: "user", content: message },
       ],
       tools: {
-        search_near_docs: tool({
-          description:
-            "Search the NEAR Protocol documentation for relevant information. Use this to find accurate, up-to-date information before answering technical questions.",
+        searchDocs: tool({
+          description: "Search the NEAR Protocol documentation index for relevant snippets.",
           inputSchema: z.object({
-            query: z.string().describe("The search query to find relevant documentation"),
-            limit: z.number().optional().describe("Maximum number of results to return (default: 5)"),
+            query: z.string().describe("Search query"),
           }),
-          execute: async ({ query, limit = 5 }) => {
-            const results = await searchNearDocs(query, limit);
-            for (const result of results.slice(0, 3)) {
-              if (result.title || result.path) {
-                sources.push({ title: result.title || "Untitled", path: result.path || "" });
+          execute: async ({ query }) => {
+            const results = await searchNearDocs(query);
+            for (const r of results) {
+              if (r.path && !sources.some((s) => s.path === r.path)) {
+                sources.push({ title: r.title, path: r.path });
               }
             }
-            return results;
+            return results.map((r) => ({ title: r.title, path: r.path, content: r.content }));
           },
+        }),
+        fetchDoc: tool({
+          description: "Fetch a full NEAR Protocol documentation page as Markdown.",
+          inputSchema: z.object({
+            path: z.string().describe("Doc PATH ending in .md, e.g. 'tutorials/quickstart.md' - not the full URL"),
+          }),
+          execute: async ({ path }) => fetchNearDoc(path),
         }),
       },
       stopWhen: stepCountIs(5),
-      temperature: 0.1,
+      temperature: 0,
       maxOutputTokens: 1024,
     });
 
-    const uniqueSources = sources.filter(
-      (s, i, arr) => arr.findIndex((x) => x.path === s.path) === i
-    );
-
-    res.json({
-      message: text,
-      sources: uniqueSources,
+    result.pipeUIMessageStreamToResponse(res, {
+      messageMetadata: ({ part }) =>
+        part.type === "finish" ? { sources } : undefined,
     });
   } catch (error) {
     console.error("Chat error:", error);
-    res.status(500).json({ error: "Failed to process chat request" });
+    res.write(`data: ${JSON.stringify({ type: "error", error: "Failed to process chat request" })}\n\n`);
+    res.end();
   }
 }
