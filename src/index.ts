@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { faucetHandler } from "./faucet.js";
