@@ -8,7 +8,10 @@ const app = express();
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-// Chat endpoint
+app.get("/api/ping", (_req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
 app.post("/api/faucet", faucetHandler);
 
 const PORT = process.env.PORT || 3000;
